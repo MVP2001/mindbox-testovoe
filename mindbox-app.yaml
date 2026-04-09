@@ -1,0 +1,217 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mindbox-prod
+  labels:
+    environment: production
+    zone-awareness: "true"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mindbox-app
+  namespace: mindbox-prod
+  labels:
+    app: mindbox-app
+    version: stable
+spec:
+  # Базовое значение, управляется HPA. При старте HPA скорректирует до minReplicas=2
+  replicas: 2
+  
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Пошаговое обновление: не более 1 пода "впереди" и не более 1 недоступного
+      # При 4 подах в пике: сначала 4+1=5 (стартует новый), затем 5-1=4 (убивается старый)
+      maxSurge: 1
+      maxUnavailable: 1
+  
+  selector:
+    matchLabels:
+      app: mindbox-app
+  
+  template:
+    metadata:
+      labels:
+        app: mindbox-app
+      annotations:
+        # Для мониторинга 
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      # Распределяем поды по зонам с допустимым skew 1 (2-1-1 для 4 подов в 3 зонах)
+      # Исправляет проблему hard anti-affinity: позволяет разместить 4 пода в 3 зонах
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule  # Гарантия распределения по зонам
+          labelSelector:
+            matchLabels:
+              app: mindbox-app
+      
+      affinity:
+        podAntiAffinity:
+          # Preferred: стараемся разнести по разным нодам (5 нод, 4 пода - идеально)
+          # Не required, чтобы не блокировать размещение при временной недоступности нод
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - mindbox-app
+                topologyKey: kubernetes.io/hostname
+      
+      containers:
+        - name: mindbox-app
+          image: your-registry/mindbox-app:v1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          
+          resources:
+            requests:
+              # Steady-state: 0.1 CPU (100m) по результатам нагрузочного теста
+              cpu: "100m"
+              # Запас не нужен, т.к. потребление "ровное"
+              memory: "128Mi"
+            limits:
+              # Burst на старт: позволяет утилизировать до 0.5 CPU при инициализации
+              # (кэширование, компиляция шаблонов, прогрев соединений)
+              cpu: "500m"
+              # Limits = Requests для Guaranteed QoS (предотвращение OOMKill соседей)
+              memory: "128Mi"
+          
+          # Startup probe: блокирует liveness/readiness до готовности приложения
+          # Даем 30 секунд (6 * 5s) на инициализацию (5-10s + запас)
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 0      # Начинаем проверять сразу
+            periodSeconds: 5
+            failureThreshold: 6         # 6 * 5s = 30s максимум
+            successThreshold: 1
+            timeoutSeconds: 2
+          
+          # Readiness: трафик (Service endpoints) только после успеха startupProbe
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 0      # Управляется startupProbe
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 2
+          
+          # Liveness: перезапуск только при реальном зависании (не при медленном ответе)
+          # Запускается только после прохождения startupProbe
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 0      # Управляется startupProbe
+            periodSeconds: 10
+            failureThreshold: 3         # 30 секунд на реакцию
+            successThreshold: 1
+            timeoutSeconds: 3
+          
+          # Graceful shutdown: даем время закрыть соединения и завершить запросы
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 15"]
+      
+      # Время на graceful termination (должно быть > preStop sleep)
+      terminationGracePeriodSeconds: 30
+      
+      # Приоритет: защита от вытеснения критичными системными подами
+      priorityClassName: production-medium
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mindbox-app-hpa
+  namespace: mindbox-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mindbox-app
+  
+  # Отказоустойчивость ночью: 2 пода (переживаем падение 1 зоны + drain ноды)
+  # Согласовано с PDB minAvailable=2 (конфликт исключен)
+  minReplicas: 2
+  
+  # 4 пода покрывают пик
+  maxReplicas: 4
+  
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Цель: ~70m CPU фактического потребления (от request 100m)
+          # При нагрузке выше 70% масштабируемся вверх
+          averageUtilization: 70
+  
+  behavior:
+    scaleUp:
+      # Быстрая реакция на утренний пик
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2              # Добавляем до 2 подов за раз
+          periodSeconds: 30
+      selectPolicy: Max
+    
+    scaleDown:
+      # Консервативное уменьшение: ждем 10 минут стабильной низкой нагрузки
+      # Защита при временных провалах
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1              # Убираем по 1 поду
+          periodSeconds: 120    # Каждые 2 минуты
+      selectPolicy: Min
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mindbox-app-pdb
+  namespace: mindbox-prod
+spec:
+  # Гарантия: при drain ноды (обновления, обслуживание) остается минимум 2 пода
+  # Согласовано с HPA minReplicas=2 (нет конфликтов ночью)
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mindbox-app
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mindbox-app
+  namespace: mindbox-prod
+  labels:
+    app: mindbox-app
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: mindbox-app
